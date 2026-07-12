@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Iridescent Fibers</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #5a5a82; }
+  #app { position: fixed; inset: 0; }
+  canvas { display: block; }
+
+  #ui {
+    position: fixed; top: 12px; left: 12px; z-index: 10;
+    font: 12px/1.5 -apple-system, "Helvetica Neue", sans-serif;
+    color: #eae6ff; background: rgba(30,28,52,0.42);
+    backdrop-filter: blur(10px);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 12px; padding: 12px 14px; width: 208px;
+    user-select: none;
+  }
+  #ui h1 { font-size: 12px; font-weight: 600; letter-spacing: .12em;
+    margin: 0 0 10px; text-transform: uppercase; opacity: .85; }
+  #ui label { display: block; margin: 9px 0 2px; opacity: .8; font-size: 11px; }
+  #ui input[type=range] { width: 100%; accent-color: #b9a8ff; }
+  #ui .row { display:flex; justify-content:space-between; align-items:center; }
+  #ui .row span { font-variant-numeric: tabular-nums; opacity:.7; }
+  #ui button {
+    margin-top: 12px; width: 100%; padding: 7px;
+    background: rgba(185,168,255,0.18); color: #eae6ff;
+    border: 1px solid rgba(185,168,255,0.4); border-radius: 8px;
+    cursor: pointer; font: inherit; font-weight: 600;
+  }
+  #ui button:hover { background: rgba(185,168,255,0.3); }
+  #hint { margin-top: 8px; opacity:.5; font-size: 10px; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="ui">
+  <h1>Iridescent Fibers</h1>
+  <div class="row"><label>Strands</label><span id="vStrands">800</span></div>
+  <input id="strands" type="range" min="300" max="2400" step="100" value="800" />
+  <div class="row"><label>Twist</label><span id="vTwist">3.0</span></div>
+  <input id="twist" type="range" min="0" max="8" step="0.1" value="3.0" />
+  <div class="row"><label>Bulge speed</label><span id="vBulge">0.55</span></div>
+  <input id="bulge" type="range" min="0" max="1.5" step="0.01" value="0.55" />
+  <div class="row"><label>Bloom</label><span id="vBloom">0.6</span></div>
+  <input id="bloom" type="range" min="0" max="2" step="0.05" value="0.6" />
+  <button id="save">Save PNG</button>
+  <div id="hint">drag: orbit · scroll: zoom</div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+const app = document.getElementById('app');
+
+// ---- renderer ----
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+app.appendChild(renderer.domElement);
+
+// ---- scene / camera ----
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(0x5c5c84, 14, 40);
+
+// background vertical gradient
+(function () {
+  const c = document.createElement('canvas');
+  c.width = 2; c.height = 256;
+  const g = c.getContext('2d').createLinearGradient(0, 0, 0, 256);
+  g.addColorStop(0.0, '#6f6d96');
+  g.addColorStop(0.5, '#62608c');
+  g.addColorStop(1.0, '#535079');
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, 2, 256);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  scene.background = tex;
+})();
+
+const camera = new THREE.PerspectiveCamera(46, innerWidth / innerHeight, 0.1, 100);
+camera.position.set(0, 0, 15);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.minDistance = 6;
+controls.maxDistance = 36;
+controls.target.set(0, 0, 0);
+
+// ---- shared uniforms ----
+const uniforms = {
+  uTime:  { value: 0 },
+  uTwist: { value: 3.0 },
+  uBulge: { value: 0.55 },
+  uHeight:{ value: 16.0 },
+  uBaseR: { value: 3.4 },
+};
+
+// ---- fiber lines ----
+const HEIGHT = uniforms.uHeight.value;
+let fibers, sparkles;
+
+function rand() { return Math.random(); }
+
+function buildFibers(N) {
+  if (fibers) { scene.remove(fibers); fibers.geometry.dispose(); }
+  if (sparkles) { scene.remove(sparkles); sparkles.geometry.dispose(); }
+
+  const P = 64;                 // points per strand
+  const verts = N * P;
+  const aHeight = new Float32Array(verts);
+  const aPhi0   = new Float32Array(verts);
+  const aRad0   = new Float32Array(verts);
+  const aSeed   = new Float32Array(verts);
+
+  for (let i = 0; i < N; i++) {
+    const phi0 = rand() * Math.PI * 2;
+    const rad0 = Math.sqrt(rand());      // fill disk toward edge a bit
+    const seed = rand();
+    for (let j = 0; j < P; j++) {
+      const idx = i * P + j;
+      aHeight[idx] = j / (P - 1);
+      aPhi0[idx]   = phi0;
+      aRad0[idx]   = rad0;
+      aSeed[idx]   = seed;
+    }
+  }
+
+  // index: line segments within each strand
+  const index = [];
+  for (let i = 0; i < N; i++)
+    for (let j = 0; j < P - 1; j++) {
+      const a = i * P + j;
+      index.push(a, a + 1);
+    }
+
+  const geo = new THREE.BufferGeometry();
+  const dummy = new Float32Array(verts * 3); // position required; computed in shader
+  geo.setAttribute('position', new THREE.BufferAttribute(dummy, 3));
+  geo.setAttribute('aHeight', new THREE.BufferAttribute(aHeight, 1));
+  geo.setAttribute('aPhi0',   new THREE.BufferAttribute(aPhi0, 1));
+  geo.setAttribute('aRad0',   new THREE.BufferAttribute(aRad0, 1));
+  geo.setAttribute('aSeed',   new THREE.BufferAttribute(aSeed, 1));
+  geo.setIndex(index);
+
+  const mat = new THREE.ShaderMaterial({
+    uniforms,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.NormalBlending,
+    fog: true,
+    vertexShader: FIBER_VS,
+    fragmentShader: FIBER_FS,
+  });
+  // inject fog
+  mat.onBeforeCompile = injectFog;
+
+  fibers = new THREE.LineSegments(geo, mat);
+  fibers.frustumCulled = false;
+  scene.add(fibers);
+
+  buildSparkles(Math.floor(N * 2.4));
+}
+
+function buildSparkles(M) {
+  const aHeight = new Float32Array(M);
+  const aPhi0   = new Float32Array(M);
+  const aRad0   = new Float32Array(M);
+  const aSeed   = new Float32Array(M);
+  for (let i = 0; i < M; i++) {
+    aHeight[i] = rand();
+    aPhi0[i]   = rand() * Math.PI * 2;
+    aRad0[i]   = Math.sqrt(rand());
+    aSeed[i]   = rand();
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(M * 3), 3));
+  geo.setAttribute('aHeight', new THREE.BufferAttribute(aHeight, 1));
+  geo.setAttribute('aPhi0',   new THREE.BufferAttribute(aPhi0, 1));
+  geo.setAttribute('aRad0',   new THREE.BufferAttribute(aRad0, 1));
+  geo.setAttribute('aSeed',   new THREE.BufferAttribute(aSeed, 1));
+
+  const mat = new THREE.ShaderMaterial({
+    uniforms,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    vertexShader: SPARK_VS,
+    fragmentShader: SPARK_FS,
+  });
+  sparkles = new THREE.Points(geo, mat);
+  sparkles.frustumCulled = false;
+  scene.add(sparkles);
+}
+
+// position math shared by both shaders
+const POS_GLSL = /* glsl */`
+  vec3 fiberPos(float t, float phi0, float rad0, float seed, float tt,
+                out vec3 nrm) {
+    float y = (t - 0.5) * uHeight;
+    // gentle centerline drift
+    float cx = 0.45 * sin(t * 2.4 + tt * 0.25);
+    float cz = 0.45 * cos(t * 2.0 - tt * 0.20);
+    // traveling bulges -> waist / swell pulsing
+    float prof = 0.62
+      + 0.34 * sin(t * 3.1 - tt * uBulge)
+      + 0.18 * sin(t * 6.3 + tt * uBulge * 0.6 + 1.3);
+    prof = max(prof, 0.28);
+    float R = uBaseR * prof;
+    // swirl + per-strand wander
+    float phi = phi0 + t * uTwist + tt * 0.15
+      + 0.35 * sin(t * 5.0 + seed * 6.2831 + tt * 0.5);
+    // keep strands spread off-axis so necks don't collapse to a point
+    float spread = 0.34 + 0.66 * rad0;
+    float rfac = spread * (0.88 + 0.12 * sin(t * 8.0 + seed * 12.0 + tt * 0.8));
+    float r = R * rfac;
+    nrm = normalize(vec3(cos(phi), 0.0, sin(phi)));
+    return vec3(cx + r * cos(phi), y, cz + r * sin(phi));
+  }
+`;
+
+const FIBER_VS = /* glsl */`
+  uniform float uTime, uTwist, uBulge, uHeight, uBaseR;
+  attribute float aHeight, aPhi0, aRad0, aSeed;
+  varying vec3 vColor;
+  varying float vAlpha;
+  varying float vFogDepth;
+  ${POS_GLSL}
+  void main() {
+    vec3 nrm;
+    vec3 pos = fiberPos(aHeight, aPhi0, aRad0, aSeed, uTime, nrm);
+    vec4 wp = modelMatrix * vec4(pos, 1.0);
+    vec3 viewDir = normalize(cameraPosition - wp.xyz);
+    float fres = pow(1.0 - abs(dot(nrm, viewDir)), 2.0);
+    float hue = fres * 1.15 + aRad0 * 0.18 + 0.12 * sin(aSeed * 6.2831);
+    vec3 irid = 0.5 + 0.5 * cos(6.2831 * (hue + vec3(0.0, 0.33, 0.67)));
+    vec3 base = vec3(0.66, 0.62, 0.88);
+    vColor = mix(base, irid, 0.5) + fres * 0.30;
+    vAlpha = 0.12 + 0.24 * fres;
+    vec4 mv = modelViewMatrix * vec4(pos, 1.0);
+    vFogDepth = -mv.z;
+    gl_Position = projectionMatrix * mv;
+  }
+`;
+
+const FIBER_FS = /* glsl */`
+  precision highp float;
+  uniform vec3 fogColor;
+  uniform float fogNear, fogFar;
+  varying vec3 vColor;
+  varying float vAlpha;
+  varying float vFogDepth;
+  void main() {
+    float f = smoothstep(fogNear, fogFar, vFogDepth);
+    vec3 col = mix(vColor, fogColor, f);
+    gl_FragColor = vec4(col, vAlpha * (1.0 - f * 0.85));
+  }
+`;
+
+const SPARK_VS = /* glsl */`
+  uniform float uTime, uTwist, uBulge, uHeight, uBaseR;
+  attribute float aHeight, aPhi0, aRad0, aSeed;
+  varying float vSpark;
+  varying vec3 vTint;
+  ${POS_GLSL}
+  void main() {
+    vec3 nrm;
+    vec3 pos = fiberPos(aHeight, aPhi0, aRad0, aSeed, uTime, nrm);
+    vec4 mv = modelViewMatrix * vec4(pos, 1.0);
+    float tw = sin(uTime * 3.0 + aSeed * 40.0)
+             * sin(uTime * 1.7 + aSeed * 13.0);
+    float spark = smoothstep(0.78, 1.0, tw);
+    vSpark = spark;
+    float hue = aSeed + uTime * 0.05;
+    vTint = 0.6 + 0.4 * cos(6.2831 * (hue + vec3(0.0, 0.33, 0.67)));
+    gl_PointSize = (0.9 + 3.0 * spark) * (18.0 / -mv.z);
+    gl_Position = projectionMatrix * mv;
+  }
+`;
+
+const SPARK_FS = /* glsl */`
+  precision highp float;
+  varying float vSpark;
+  varying vec3 vTint;
+  void main() {
+    vec2 d = gl_PointCoord - 0.5;
+    float r = length(d);
+    if (r > 0.5) discard;
+    float a = smoothstep(0.5, 0.0, r) * vSpark;
+    vec3 col = mix(vec3(1.0), vTint, 0.5);
+    gl_FragColor = vec4(col, a * 0.85);
+  }
+`;
+
+function injectFog(shader) {
+  shader.uniforms.fogColor = { value: scene.fog.color };
+  shader.uniforms.fogNear  = { value: scene.fog.near };
+  shader.uniforms.fogFar   = { value: scene.fog.far };
+}
+
+// ---- post (bloom) ----
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(
+  new THREE.Vector2(innerWidth, innerHeight), 0.6, 0.5, 0.65);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
+// ---- UI ----
+const $ = id => document.getElementById(id);
+function bind(id, vid, fn, fmt) {
+  $(id).addEventListener('input', e => {
+    const v = parseFloat(e.target.value);
+    $(vid).textContent = fmt ? fmt(v) : v;
+    fn(v);
+  });
+}
+bind('twist', 'vTwist', v => uniforms.uTwist.value = v, v => v.toFixed(1));
+bind('bulge', 'vBulge', v => uniforms.uBulge.value = v, v => v.toFixed(2));
+bind('bloom', 'vBloom', v => bloom.strength = v, v => v.toFixed(2));
+bind('strands', 'vStrands', v => buildFibers(v));
+
+$('save').addEventListener('click', () => {
+  composer.render();
+  const a = document.createElement('a');
+  a.download = 'iridescent-fibers.png';
+  a.href = renderer.domElement.toDataURL('image/png');
+  a.click();
+});
+
+// ---- resize ----
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+});
+
+// ---- go ----
+buildFibers(800);
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  uniforms.uTime.value = clock.getElapsedTime();
+  controls.update();
+  composer.render();
+});
+</script>
+</body>
+</html>
